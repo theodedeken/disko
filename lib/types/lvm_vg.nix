@@ -1,11 +1,15 @@
-{ config, options, lib, diskoLib, ... }:
-let
+{
+  config,
+  options,
+  lib,
+  diskoLib,
+  ...
+}: let
   # Load kernel modules to ensure device mapper types are available
   kernelModules = lib.filter (x: x != "") (map
     (lv: lib.optionalString (lv.lvm_type != null && lv.lvm_type != "thinlv") "dm-${lv.lvm_type}")
-  (lib.attrValues config.lvs));
-in
-{
+    (lib.attrValues config.lvs));
+in {
   options = {
     name = lib.mkOption {
       type = lib.types.str;
@@ -13,12 +17,12 @@ in
       description = "Name of the volume group";
     };
     type = lib.mkOption {
-      type = lib.types.enum [ "lvm_vg" ];
+      type = lib.types.enum ["lvm_vg"];
       internal = true;
       description = "Type";
     };
     lvs = lib.mkOption {
-      type = lib.types.attrsOf (lib.types.submodule ({ name, ... }@lv: {
+      type = lib.types.attrsOf (lib.types.submodule ({name, ...} @ lv: {
         options = {
           name = lib.mkOption {
             type = lib.types.str;
@@ -27,7 +31,17 @@ in
           };
           priority = lib.mkOption {
             type = lib.types.int;
-            default = (if lv.config.lvm_type == "thin-pool" then 501 else 1000) + (if lib.hasInfix "100%" lv.config.size then 251 else 0);
+            default =
+              (
+                if lv.config.lvm_type == "thin-pool"
+                then 501
+                else 1000
+              )
+              + (
+                if lib.hasInfix "100%" lv.config.size
+                then 251
+                else 0
+              );
             defaultText = lib.literalExpression ''
               if (lib.hasInfix "100%" lv.config.size) then 9001 else 1000
             '';
@@ -39,13 +53,13 @@ in
           };
           lvm_type = lib.mkOption {
             # TODO: add raid10
-            type = lib.types.nullOr (lib.types.enum [ "mirror" "raid0" "raid1" "raid4" "raid5" "raid6" "thin-pool" "thinlv" ]); # TODO add all lib.types
+            type = lib.types.nullOr (lib.types.enum ["mirror" "raid0" "raid1" "raid4" "raid5" "raid6" "thin-pool" "thinlv" "cache"]); # TODO add all lib.types
             default = null; # maybe there is always a default type?
             description = "LVM type";
           };
           extraArgs = lib.mkOption {
             type = lib.types.listOf lib.types.str;
-            default = [ ];
+            default = [];
             description = "Extra arguments";
           };
           pool = lib.mkOption {
@@ -53,10 +67,18 @@ in
             default = null;
             description = "Name of pool LV that this LV belongs to";
           };
-          content = diskoLib.partitionType { parent = config; device = "/dev/${config.name}/${lv.config.name}"; };
+          content = diskoLib.partitionType {
+            parent = config;
+            device = "/dev/${config.name}/${lv.config.name}";
+          };
+          pvs = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [];
+            description = "Constrain this LV to these PVs";
+          };
         };
       }));
-      default = { };
+      default = {};
       description = "LVS for the volume group";
     };
     _meta = lib.mkOption {
@@ -65,94 +87,116 @@ in
       type = diskoLib.jsonType;
       default =
         diskoLib.deepMergeMap
-          (lv:
-            lib.optionalAttrs (lv.content != null) (lv.content._meta [ "lvm_vg" config.name ])
-          )
-          (lib.attrValues config.lvs);
+        (
+          lv:
+            lib.optionalAttrs (lv.content != null) (lv.content._meta ["lvm_vg" config.name])
+        )
+        (lib.attrValues config.lvs);
       description = "Metadata";
     };
     _create = diskoLib.mkCreateOption {
       inherit config options;
-      default =
-        let
-          sortedLvs = lib.sort (a: b: a.priority < b.priority) (lib.attrValues config.lvs);
-        in
-        ''
-          ${lib.concatMapStringsSep "\n" (k: ''modprobe "${k}"'') kernelModules}
-          readarray -t lvm_devices < <(cat "$disko_devices_dir"/lvm_${config.name})
-          if ! vgdisplay "${config.name}" >/dev/null; then
-            vgcreate ${config.name} \
-              "''${lvm_devices[@]}"
-          fi
-          ${lib.concatMapStrings (lv: ''
+      default = let
+        sortedLvs = lib.sort (a: b: a.priority < b.priority) (lib.attrValues config.lvs);
+      in ''
+        ${lib.concatMapStringsSep "\n" (k: ''modprobe "${k}"'') kernelModules}
+        readarray -t lvm_devices < <(cat "$disko_devices_dir"/lvm_${config.name})
+        if ! vgdisplay "${config.name}" >/dev/null; then
+          vgcreate ${config.name} \
+            "''${lvm_devices[@]}"
+        fi
+        ${lib.concatMapStrings (lv: let
+            volume_name =
+              if (lv.lvm_type == "cache")
+              then lv.pool
+              else config.name;
+          in ''
             if ! lvdisplay '${config.name}/${lv.name}'; then
               lvcreate \
                 --yes \
-                ${if (lv.lvm_type == "thinlv") then "-V"
-                  else if lib.hasInfix "%" lv.size then "-l" else "-L"} \
+                ${
+              if (lv.lvm_type == "thinlv")
+              then "-V"
+              else if lib.hasInfix "%" lv.size
+              then "-l"
+              else "-L"
+            } \
                   ${lv.size} \
                 -n ${lv.name} \
                 ${lib.optionalString (lv.lvm_type == "thinlv") "--thinpool=${lv.pool}"} \
                 ${lib.optionalString (lv.lvm_type != null && lv.lvm_type != "thinlv") "--type=${lv.lvm_type}"} \
                 ${toString lv.extraArgs} \
-                ${config.name}
+                ${volume_name} \
+                ${toString lv.pvs}
             fi
-          '') sortedLvs}
+          '')
+          sortedLvs}
 
-          ${lib.concatMapStrings (lv: ''
+        ${lib.concatMapStrings (lv: ''
             ${lib.optionalString (lv.content != null) lv.content._create}
-          '') sortedLvs}
-        '';
+          '')
+          sortedLvs}
+      '';
     };
     _mount = diskoLib.mkMountOption {
       inherit config options;
-      default =
-        let
-          lvMounts = diskoLib.deepMergeMap
-            (lv:
+      default = let
+        lvMounts =
+          diskoLib.deepMergeMap
+          (
+            lv:
               lib.optionalAttrs (lv.content != null) lv.content._mount
-            )
-            (lib.attrValues config.lvs);
-        in
-        {
-          dev = ''
-            vgchange -a y
-            ${lib.concatMapStrings (x: x.dev or "") (lib.attrValues lvMounts)}
-          '';
-          fs = lvMounts.fs or { };
-        };
+          )
+          (lib.attrValues config.lvs);
+      in {
+        dev = ''
+          vgchange -a y
+          ${lib.concatMapStrings (x: x.dev or "") (lib.attrValues lvMounts)}
+        '';
+        fs = lvMounts.fs or {};
+      };
     };
     _config = lib.mkOption {
       internal = true;
       readOnly = true;
-      default = [ { boot.initrd.kernelModules = kernelModules; } ] ++
-        map
-          (lv: [
-            (lib.optional (lv.content != null) lv.content._config)
-            (lib.optional (lv.lvm_type != null) {
-              boot.initrd.kernelModules = [ (if lv.lvm_type == "mirror" then "dm-mirror" else "dm-raid") ]
-                ++ lib.optional (lv.lvm_type == "raid0") "raid0"
-                ++ lib.optional (lv.lvm_type == "raid1") "raid1"
-                # ++ lib.optional (lv.lvm_type == "raid10") "raid10"
-                ++ lib.optional
-                (lv.lvm_type == "raid4" ||
-                  lv.lvm_type == "raid5" ||
-                  lv.lvm_type == "raid6") "raid456";
-
-            })
-          ])
-          (lib.attrValues config.lvs);
+      default =
+        [{boot.initrd.kernelModules = kernelModules;}]
+        ++ map
+        (lv: [
+          (lib.optional (lv.content != null) lv.content._config)
+          (lib.optional (lv.lvm_type != null) {
+            boot.initrd.kernelModules =
+              [
+                (
+                  if lv.lvm_type == "mirror"
+                  then "dm-mirror"
+                  else "dm-raid"
+                )
+              ]
+              ++ lib.optional (lv.lvm_type == "raid0") "raid0"
+              ++ lib.optional (lv.lvm_type == "raid1") "raid1"
+              # ++ lib.optional (lv.lvm_type == "raid10") "raid10"
+              ++ lib.optional
+              (lv.lvm_type
+                == "raid4"
+                || lv.lvm_type == "raid5"
+                || lv.lvm_type == "raid6") "raid456";
+          })
+        ])
+        (lib.attrValues config.lvs);
       description = "NixOS configuration";
     };
     _pkgs = lib.mkOption {
       internal = true;
       readOnly = true;
       type = lib.types.functionTo (lib.types.listOf lib.types.package);
-      default = pkgs: lib.flatten (map
-        (lv:
-          lib.optional (lv.content != null) (lv.content._pkgs pkgs)
-        )
-        (lib.attrValues config.lvs));
+      default = pkgs:
+        lib.flatten (map
+          (
+            lv:
+              lib.optional (lv.content != null) (lv.content._pkgs pkgs)
+          )
+          (lib.attrValues config.lvs));
       description = "Packages";
     };
   };
